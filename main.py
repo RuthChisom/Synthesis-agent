@@ -34,6 +34,7 @@ from planner import IssuePlanner
 from solver import IssueSolver, FileChange, Solution
 from state import State
 from test_writer import TestEngineer, TestWriterResult, find_test_paths
+from reviewer import PRReviewer, ReviewResult
 
 load_dotenv()
 
@@ -103,6 +104,7 @@ def process_issue(
     planner: IssuePlanner,
     engineer: SeniorEngineer,
     test_engineer: TestEngineer,
+    reviewer: PRReviewer,
     solver: IssueSolver,
     state: State,
 ) -> None:
@@ -232,6 +234,38 @@ def process_issue(
     else:
         log.info("Issue #%d: test engineer produced no tests.", issue.number)
 
+    # Step 6 — Review: strict pre-submission gate to prevent bad PRs.
+    all_files_map = {c.path: c.content for c in solution.changes if c.action != "delete"}
+    test_files_map = {
+        c.path: c.content
+        for c in solution.changes
+        if c.action != "delete" and find_test_paths(c.path)
+    }
+    review: ReviewResult = reviewer.review(
+        issue_summary=issue.body,
+        updated_files=all_files_map,
+        test_files=test_files_map,
+    )
+
+    if review.issues:
+        log.info(
+            "Issue #%d review issues [%s]: %s",
+            issue.number,
+            review.fix_priority,
+            "; ".join(review.issues),
+        )
+
+    if not review.approve:
+        log.info(
+            "Issue #%d: review REJECTED (priority=%s) — skipping PR submission.",
+            issue.number,
+            review.fix_priority,
+        )
+        state.mark_failed(issue.url, issue.repo_full_name, issue.number)
+        return
+
+    log.info("Issue #%d: review APPROVED.", issue.number)
+
     # Fork + push + open PR.
     try:
         fork_name = gh.ensure_fork(issue.repo_full_name)
@@ -293,11 +327,12 @@ def scan_repos(
     planner: IssuePlanner,
     engineer: SeniorEngineer,
     test_engineer: TestEngineer,
+    reviewer: PRReviewer,
     solver: IssueSolver,
     state: State,
     config: dict,
 ) -> None:
-    """One full scan: evaluate, plan, implement, test, and solve bounty issues."""
+    """One full scan: evaluate, plan, implement, test, review, and submit bounty PRs."""
     min_bounty = config["min_bounty_eth"]
 
     for repo_name in config["target_repos"]:
@@ -316,7 +351,7 @@ def scan_repos(
             if bounty_eth is None or bounty_eth < min_bounty:
                 continue
 
-            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, solver, state)
+            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, solver, state)
 
     check_open_prs(gh, state)
     log.info("State: %s", state.summary())
@@ -346,6 +381,7 @@ def main() -> None:
     planner = IssuePlanner(cfg["anthropic_key"])
     engineer = SeniorEngineer(cfg["anthropic_key"])
     test_engineer = TestEngineer(cfg["anthropic_key"])
+    reviewer = PRReviewer(cfg["anthropic_key"])
     solver = IssueSolver(cfg["anthropic_key"], gh)
     state = State()
 
@@ -358,7 +394,7 @@ def main() -> None:
 
     while True:
         try:
-            scan_repos(gh, evaluator, planner, engineer, test_engineer, solver, state, cfg)
+            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, solver, state, cfg)
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down.")
             break
