@@ -110,6 +110,25 @@ class GithubClient:
         repo = self._gh.get_repo(repo_full_name)
         return repo.description or ""
 
+    def get_file_tree(self, repo_full_name: str, max_entries: int = 300) -> str:
+        """
+        Return a newline-separated list of file paths in the repo's default branch.
+        Fetches the recursive Git tree in one API call and caps at *max_entries*
+        to avoid overwhelming the planner prompt.
+        """
+        repo = self._gh.get_repo(repo_full_name)
+        try:
+            tree = repo.get_git_tree(repo.default_branch, recursive=True)
+            paths = [
+                elem.path
+                for elem in tree.tree
+                if elem.type == "blob"
+            ][:max_entries]
+            return "\n".join(paths)
+        except GithubException as exc:
+            log.warning("get_file_tree %s: %s", repo_full_name, exc)
+            return ""
+
     def get_recent_commit_count(self, repo_full_name: str, days: int = 30) -> int:
         """
         Return the number of commits to the default branch in the last *days* days.

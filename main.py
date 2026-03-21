@@ -29,6 +29,7 @@ from bounty import extract_from_issue
 from evaluator import BountyEvaluator, EvaluationResult, format_tech_stack
 from github_client import GithubClient, IssueInfo, PRInfo
 from identity import load_public_identity, verify_identity
+from planner import IssuePlanner
 from solver import IssueSolver
 from state import State
 
@@ -80,10 +81,11 @@ def process_issue(
     bounty_eth: float,
     gh: GithubClient,
     evaluator: BountyEvaluator,
+    planner: IssuePlanner,
     solver: IssueSolver,
     state: State,
 ) -> None:
-    """Evaluate, solve, and submit a PR for one bounty issue."""
+    """Evaluate, plan, solve, and submit a PR for one bounty issue."""
     log.info(
         "Evaluating issue #%d in %s  [bounty: %.4f ETH]",
         issue.number,
@@ -91,13 +93,13 @@ def process_issue(
         bounty_eth,
     )
 
-    # Gather repo context for the evaluator.
+    # Gather repo context (shared by evaluator and planner).
     languages = gh.get_languages(issue.repo_full_name)
     tech_stack = format_tech_stack(languages)
     repo_description = gh.get_repo_description(issue.repo_full_name)
     recent_commits = gh.get_recent_commit_count(issue.repo_full_name, days=30)
 
-    # Evaluate — structured senior-engineer verdict.
+    # Step 1 — Evaluate: structured senior-engineer verdict.
     evaluation: EvaluationResult = evaluator.evaluate(
         repo_name=issue.repo_full_name,
         repo_description=repo_description,
@@ -125,8 +127,29 @@ def process_issue(
         state.mark_skipped(issue.url, issue.repo_full_name, issue.number)
         return
 
-    # Solve — may take up to MAX_EXPLORE_TURNS Claude turns.
-    solution = solver.solve(issue, languages)
+    # Step 2 — Plan: architect-level breakdown of exact changes needed.
+    file_tree = gh.get_file_tree(issue.repo_full_name)
+    plan = planner.plan(
+        issue_title=issue.title,
+        issue_body=issue.body,
+        file_tree=file_tree,
+        tech_stack=tech_stack,
+    )
+
+    if plan.steps:
+        log.info(
+            "Issue #%d plan: %d steps, %d files, %d edge cases, %d tests",
+            issue.number,
+            len(plan.steps),
+            len(plan.all_files),
+            len(plan.edge_cases),
+            len(plan.tests_needed),
+        )
+    else:
+        log.info("Issue #%d: planner returned empty plan — proceeding without it.", issue.number)
+
+    # Step 3 — Solve: guided by the plan, may take up to MAX_EXPLORE_TURNS turns.
+    solution = solver.solve(issue, languages, plan=plan)
     if solution is None:
         log.info("Issue #%d: no solution generated.", issue.number)
         state.mark_failed(issue.url, issue.repo_full_name, issue.number)
@@ -197,11 +220,12 @@ def check_open_prs(gh: GithubClient, state: State) -> None:
 def scan_repos(
     gh: GithubClient,
     evaluator: BountyEvaluator,
+    planner: IssuePlanner,
     solver: IssueSolver,
     state: State,
     config: dict,
 ) -> None:
-    """One full scan: evaluate and solve bounty issues across all target repos."""
+    """One full scan: evaluate, plan, and solve bounty issues across all target repos."""
     min_bounty = config["min_bounty_eth"]
 
     for repo_name in config["target_repos"]:
@@ -220,7 +244,7 @@ def scan_repos(
             if bounty_eth is None or bounty_eth < min_bounty:
                 continue
 
-            process_issue(issue, bounty_eth, gh, evaluator, solver, state)
+            process_issue(issue, bounty_eth, gh, evaluator, planner, solver, state)
 
     check_open_prs(gh, state)
     log.info("State: %s", state.summary())
@@ -247,6 +271,7 @@ def main() -> None:
     cfg = _config()
     gh = GithubClient(cfg["github_token"], cfg["github_username"])
     evaluator = BountyEvaluator(cfg["anthropic_key"])
+    planner = IssuePlanner(cfg["anthropic_key"])
     solver = IssueSolver(cfg["anthropic_key"], gh)
     state = State()
 
@@ -259,7 +284,7 @@ def main() -> None:
 
     while True:
         try:
-            scan_repos(gh, evaluator, solver, state, cfg)
+            scan_repos(gh, evaluator, planner, solver, state, cfg)
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down.")
             break

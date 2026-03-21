@@ -20,6 +20,7 @@ from typing import Optional
 import anthropic
 
 from github_client import GithubClient, IssueInfo
+from planner import IssuePlan
 
 log = logging.getLogger(__name__)
 
@@ -162,9 +163,18 @@ class IssueSolver:
         self._client = anthropic.Anthropic(api_key=anthropic_api_key)
         self._gh = github_client
 
-    def solve(self, issue: IssueInfo, languages: dict[str, int]) -> Optional[Solution]:
+    def solve(
+        self,
+        issue: IssueInfo,
+        languages: dict[str, int],
+        plan: Optional[IssuePlan] = None,
+    ) -> Optional[Solution]:
         """
         Attempt to solve the issue by reading repo files and generating a fix.
+
+        If *plan* is provided (from IssuePlanner), it is injected into the system
+        prompt so Claude knows exactly which files to read and what to change.
+
         Returns a Solution, or None if no fix could be generated.
         """
         lang_summary = ", ".join(
@@ -172,13 +182,17 @@ class IssueSolver:
             for lang, bytes_ in sorted(languages.items(), key=lambda x: -x[1])[:5]
         )
 
+        plan_section = ""
+        if plan and plan.steps:
+            plan_section = "\n\n" + plan.to_solver_context()
+
         system_prompt = f"""\
 You are an autonomous coding agent solving GitHub issues.
 You have read-only access to the repository via tools, and will submit a fix
 by calling submit_fix() with the complete, correct file contents.
 
 Repository: {issue.repo_full_name}
-Primary languages: {lang_summary or 'unknown'}
+Primary languages: {lang_summary or 'unknown'}{plan_section}
 
 Rules:
 1. Read the relevant files before making changes — do not guess at content.
