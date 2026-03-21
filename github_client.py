@@ -13,6 +13,7 @@ import base64
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from github import Github, GithubException
@@ -103,6 +104,27 @@ class GithubClient:
         """Return {language: bytes} for the repo."""
         repo = self._gh.get_repo(repo_full_name)
         return dict(repo.get_languages())
+
+    def get_repo_description(self, repo_full_name: str) -> str:
+        """Return the repo's description string, or '' if absent."""
+        repo = self._gh.get_repo(repo_full_name)
+        return repo.description or ""
+
+    def get_recent_commit_count(self, repo_full_name: str, days: int = 30) -> int:
+        """
+        Return the number of commits to the default branch in the last *days* days.
+        Capped at 500 to avoid iterating huge repos.
+        """
+        repo = self._gh.get_repo(repo_full_name)
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        try:
+            commits = repo.get_commits(since=since)
+            # totalCount is fetched with a single API call by PyGithub.
+            count = commits.totalCount
+            return min(count, 500)
+        except GithubException as exc:
+            log.warning("get_recent_commit_count %s: %s", repo_full_name, exc)
+            return 0
 
     # ------------------------------------------------------------------
     # Fork + branch + commit + PR

@@ -153,26 +153,6 @@ _TOOLS: list[dict] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Triage prompt
-# ---------------------------------------------------------------------------
-
-_TRIAGE_SYSTEM = """\
-You are a triage assistant for an autonomous coding agent.
-Given a GitHub issue, decide whether it can be solved by reading source files
-and writing code — without human interaction, external access, or guessing.
-
-Reply with a JSON object on a single line:
-{"solvable": true/false, "reason": "<one sentence>"}
-
-Mark as NOT solvable if the issue:
-- Requires design decisions or user input
-- Is about deployment, environment, or secrets
-- Is a feature request that is under-specified
-- Requires UI screenshots or manual testing
-- Has already been closed or is a duplicate
-"""
-
-# ---------------------------------------------------------------------------
 # IssueSolver
 # ---------------------------------------------------------------------------
 
@@ -181,38 +161,6 @@ class IssueSolver:
     def __init__(self, anthropic_api_key: str, github_client: GithubClient):
         self._client = anthropic.Anthropic(api_key=anthropic_api_key)
         self._gh = github_client
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def triage(self, issue: IssueInfo) -> tuple[bool, str]:
-        """
-        Quick triage: return (solvable, reason).
-        Uses a cheap Claude call — no tools.
-        """
-        response = self._client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=256,
-            system=_TRIAGE_SYSTEM,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Repository: {issue.repo_full_name}\n"
-                        f"Issue #{issue.number}: {issue.title}\n\n"
-                        f"{issue.body}"
-                    ),
-                }
-            ],
-        )
-        text = response.content[0].text.strip()
-        try:
-            data = json.loads(text)
-            return bool(data["solvable"]), data.get("reason", "")
-        except (json.JSONDecodeError, KeyError):
-            log.warning("Triage returned unparseable response: %s", text)
-            return False, "triage response unparseable"
 
     def solve(self, issue: IssueInfo, languages: dict[str, int]) -> Optional[Solution]:
         """
