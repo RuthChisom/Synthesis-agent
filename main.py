@@ -29,8 +29,9 @@ from bounty import extract_from_issue
 from evaluator import BountyEvaluator, EvaluationResult, format_tech_stack
 from github_client import GithubClient, IssueInfo, PRInfo
 from identity import load_public_identity, verify_identity
+from implementer import ImplementationResult, SeniorEngineer
 from planner import IssuePlanner
-from solver import IssueSolver
+from solver import IssueSolver, FileChange, Solution
 from state import State
 
 load_dotenv()
@@ -76,12 +77,30 @@ def _config() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _solution_from_implementation(
+    result: ImplementationResult,
+    issue: IssueInfo,
+) -> Solution:
+    """Convert an ImplementationResult into a Solution ready for PR submission."""
+    changes = [
+        FileChange(path=f.file_path, content=f.content, action="modify")
+        for f in result.updated_files
+    ]
+    title = f"Fix: {issue.title}"[:72]
+    body = (
+        f"{result.summary_of_changes}\n\n"
+        f"Closes #{issue.number}"
+    )
+    return Solution(changes=changes, pr_title=title, pr_body=body, confidence="high")
+
+
 def process_issue(
     issue: IssueInfo,
     bounty_eth: float,
     gh: GithubClient,
     evaluator: BountyEvaluator,
     planner: IssuePlanner,
+    engineer: SeniorEngineer,
     solver: IssueSolver,
     state: State,
 ) -> None:
@@ -148,8 +167,34 @@ def process_issue(
     else:
         log.info("Issue #%d: planner returned empty plan — proceeding without it.", issue.number)
 
-    # Step 3 — Solve: guided by the plan, may take up to MAX_EXPLORE_TURNS turns.
-    solution = solver.solve(issue, languages, plan=plan)
+    # Step 3 — Implement: read the exact files the plan named, then write the fix.
+    solution: Solution | None = None
+    if plan.steps:
+        files_content = gh.read_files(issue.repo_full_name, plan.all_files)
+        log.info(
+            "Issue #%d: read %d/%d planned files for implementer.",
+            issue.number,
+            len(files_content),
+            len(plan.all_files),
+        )
+        impl: ImplementationResult = engineer.implement(plan, files_content)
+        if impl.succeeded:
+            log.info(
+                "Issue #%d: implementer produced %d file(s) — %s",
+                issue.number,
+                len(impl.updated_files),
+                impl.summary_of_changes,
+            )
+            solution = _solution_from_implementation(impl, issue)
+
+    # Step 4 — Fallback: if implementer produced nothing, use the multi-turn solver.
+    if solution is None:
+        log.info(
+            "Issue #%d: implementer yielded no output — falling back to solver.",
+            issue.number,
+        )
+        solution = solver.solve(issue, languages, plan=plan)
+
     if solution is None:
         log.info("Issue #%d: no solution generated.", issue.number)
         state.mark_failed(issue.url, issue.repo_full_name, issue.number)
@@ -221,11 +266,12 @@ def scan_repos(
     gh: GithubClient,
     evaluator: BountyEvaluator,
     planner: IssuePlanner,
+    engineer: SeniorEngineer,
     solver: IssueSolver,
     state: State,
     config: dict,
 ) -> None:
-    """One full scan: evaluate, plan, and solve bounty issues across all target repos."""
+    """One full scan: evaluate, plan, implement, and solve bounty issues."""
     min_bounty = config["min_bounty_eth"]
 
     for repo_name in config["target_repos"]:
@@ -244,7 +290,7 @@ def scan_repos(
             if bounty_eth is None or bounty_eth < min_bounty:
                 continue
 
-            process_issue(issue, bounty_eth, gh, evaluator, planner, solver, state)
+            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, solver, state)
 
     check_open_prs(gh, state)
     log.info("State: %s", state.summary())
@@ -272,6 +318,7 @@ def main() -> None:
     gh = GithubClient(cfg["github_token"], cfg["github_username"])
     evaluator = BountyEvaluator(cfg["anthropic_key"])
     planner = IssuePlanner(cfg["anthropic_key"])
+    engineer = SeniorEngineer(cfg["anthropic_key"])
     solver = IssueSolver(cfg["anthropic_key"], gh)
     state = State()
 
@@ -284,7 +331,7 @@ def main() -> None:
 
     while True:
         try:
-            scan_repos(gh, evaluator, planner, solver, state, cfg)
+            scan_repos(gh, evaluator, planner, engineer, solver, state, cfg)
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down.")
             break

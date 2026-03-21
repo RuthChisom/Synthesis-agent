@@ -100,6 +100,18 @@ class GithubClient:
             log.warning("read_file %s/%s: %s", repo_full_name, path, exc)
             return None
 
+    def read_files(self, repo_full_name: str, paths: list[str]) -> dict[str, str]:
+        """
+        Read multiple files and return {path: content}.
+        Silently skips files that cannot be read (binary, missing, etc.).
+        """
+        result: dict[str, str] = {}
+        for path in paths:
+            content = self.read_file(repo_full_name, path)
+            if content is not None:
+                result[path] = content
+        return result
+
     def get_languages(self, repo_full_name: str) -> dict[str, int]:
         """Return {language: bytes} for the repo."""
         repo = self._gh.get_repo(repo_full_name)
