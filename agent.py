@@ -20,6 +20,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from ethereum import EthereumPaymentClient
+from identity import get_agent_header, load_public_identity, verify_identity
 
 load_dotenv()
 
@@ -179,9 +180,14 @@ def run_agent(user_request: str, eth_client: EthereumPaymentClient) -> str:
     """
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-    system_prompt = f"""You are a transparent, autonomous Ethereum payment agent.
+    identity = load_public_identity()
+    system_prompt = f"""You are {identity['name']}, a transparent autonomous Ethereum payment agent.
 
-Your wallet address: {eth_client.address}
+Identity
+  Name    : {identity['name']}
+  Address : {eth_client.address}
+  Track   : {identity['track']}
+  Hackathon: {identity['hackathon']}
 
 You help users send ETH payments on-chain. For every payment you:
 1. Check the current balance and gas costs
@@ -248,11 +254,12 @@ or if a payment would leave insufficient funds for gas, say so clearly.
 
 def demo_mode() -> None:
     """Run a simulated demo without a live Ethereum connection."""
+    identity = load_public_identity()
     print("=== Synthesis Hackathon — Agents that Pay (DEMO MODE) ===")
     print("No ETH_RPC_URL or ETH_PRIVATE_KEY set. Running in simulation mode.\n")
 
     class MockEthClient:
-        address = "0xDemoAgent0000000000000000000000000000001"
+        address = identity["address"]
         approval_threshold = int(0.01 * 1e18)
         max_daily_spend = int(0.1 * 1e18)
         _daily_spent = 0
@@ -282,7 +289,19 @@ def demo_mode() -> None:
     run_agent(test_request, mock_client)  # type: ignore[arg-type]
 
 
+def print_identity_banner() -> None:
+    identity = load_public_identity()
+    valid = verify_identity(identity)
+    status = "✓ verified" if valid else "✗ INVALID"
+    print(f"Agent  : {identity['name']}  [{status}]")
+    print(f"Address: {identity['address']}")
+    print(f"Track  : {identity['track']}")
+    print()
+
+
 def main() -> None:
+    print_identity_banner()
+
     rpc_url = os.environ.get("ETH_RPC_URL", "")
     private_key = os.environ.get("ETH_PRIVATE_KEY", "")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")

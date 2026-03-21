@@ -1,0 +1,12 @@
+{
+  "name": "SynthesisPayAgent",
+  "version": "1.0.0",
+  "address": "0x98678e12D036EB6C56D22e82bD57FDaf0Ece6920",
+  "public_key": "0xd17efc8d15c099935b1b09ba160dde387bbb88ef9a40373ca231bfeecbcea5e737a73f259ff15b236c20d3b1680202c03efe54e21b09ea17d2b0f91a2ba0bc8f",
+  "created_at": "2026-03-21T00:00:00Z",
+  "hackathon": "The Synthesis — March 2026",
+  "track": "Agents that pay",
+  "repo": "https://github.com/RuthChisom/Synthesis-agent",
+  "manifest_hash": "51f6bf067438044925b7b50f1530a4aa9d6eff159e115dc40e42a61318dad3c6",
+  "signature": "92aab8bfc5958d6f5e8987c409091231704b0973a0dbacd963355dbecbaf59a119567ef581b213ba0590e4e777fb06cf52c2a5b1700b84b2006ac80ce6be96a01c"
+}
