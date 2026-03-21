@@ -1,4 +1,5 @@
 anthropic>=0.40.0
+PyGithub>=2.1.0
 web3>=7.0.0
 python-dotenv>=1.0.0
 eth-account>=0.13.0

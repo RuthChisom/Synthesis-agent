@@ -1,0 +1,253 @@
+"""
+Autonomous GitHub issue-solving agent — main entry point.
+
+Loop:
+  1. For each target repo, fetch open issues.
+  2. For each issue with an ETH bounty, triage and attempt to solve.
+  3. Submit a PR for accepted solutions.
+  4. Poll open PRs; on merge, log expected ETH payment.
+
+Environment variables (see .env.example):
+  ANTHROPIC_API_KEY   — required
+  GITHUB_TOKEN        — required
+  GITHUB_USERNAME     — agent's GitHub username (must own the token)
+  TARGET_REPOS        — comma-separated "owner/repo" list
+  ETH_PRIVATE_KEY     — for receiving payments (optional in solve-only mode)
+  ETH_RPC_URL         — for monitoring wallet (optional in solve-only mode)
+  POLL_INTERVAL       — seconds between full scan cycles (default: 300)
+  MIN_BOUNTY_ETH      — minimum bounty to consider (default: 0.001)
+"""
+
+import logging
+import os
+import sys
+import time
+from typing import Optional
+
+from dotenv import load_dotenv
+
+from bounty import extract_from_issue
+from github_client import GithubClient, IssueInfo, PRInfo
+from identity import load_public_identity, verify_identity
+from solver import IssueSolver
+from state import State
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("main")
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+def _require(key: str) -> str:
+    value = os.environ.get(key, "")
+    if not value:
+        log.error("Missing required environment variable: %s", key)
+        sys.exit(1)
+    return value
+
+
+def _config() -> dict:
+    return {
+        "anthropic_key": _require("ANTHROPIC_API_KEY"),
+        "github_token": _require("GITHUB_TOKEN"),
+        "github_username": _require("GITHUB_USERNAME"),
+        "target_repos": [
+            r.strip()
+            for r in _require("TARGET_REPOS").split(",")
+            if r.strip()
+        ],
+        "poll_interval": int(os.environ.get("POLL_INTERVAL", "300")),
+        "min_bounty_eth": float(os.environ.get("MIN_BOUNTY_ETH", "0.001")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+
+def process_issue(
+    issue: IssueInfo,
+    bounty_eth: float,
+    gh: GithubClient,
+    solver: IssueSolver,
+    state: State,
+    config: dict,
+) -> None:
+    """Triage, solve, and submit a PR for one issue."""
+    log.info(
+        "Processing issue #%d in %s  [bounty: %.4f ETH]",
+        issue.number,
+        issue.repo_full_name,
+        bounty_eth,
+    )
+
+    # Triage — cheap Haiku call.
+    solvable, reason = solver.triage(issue)
+    if not solvable:
+        log.info("Issue #%d skipped: %s", issue.number, reason)
+        state.mark_skipped(issue.url, issue.repo_full_name, issue.number)
+        return
+
+    log.info("Issue #%d triaged as solvable: %s", issue.number, reason)
+
+    # Fetch repo language info for solver context.
+    languages = gh.get_languages(issue.repo_full_name)
+
+    # Solve — may take several Claude turns.
+    solution = solver.solve(issue, languages)
+    if solution is None:
+        log.info("Issue #%d: no solution generated.", issue.number)
+        state.mark_failed(issue.url, issue.repo_full_name, issue.number)
+        return
+
+    log.info(
+        "Issue #%d: solution ready  confidence=%s  files=%d",
+        issue.number,
+        solution.confidence,
+        len(solution.changes),
+    )
+
+    # Fork + push + open PR.
+    try:
+        fork_name = gh.ensure_fork(issue.repo_full_name)
+        pr = gh.push_changes_and_open_pr(
+            base_repo_full_name=issue.repo_full_name,
+            fork_full_name=fork_name,
+            branch_name=solution.branch_name,
+            file_changes=solution.file_map,
+            pr_title=solution.pr_title,
+            pr_body=solution.pr_body,
+            issue_number=issue.number,
+        )
+    except Exception as exc:
+        log.error("Issue #%d: failed to submit PR: %s", issue.number, exc)
+        state.mark_failed(issue.url, issue.repo_full_name, issue.number)
+        return
+
+    state.mark_submitted(
+        issue_url=issue.url,
+        repo=issue.repo_full_name,
+        issue_number=issue.number,
+        pr_url=pr.url,
+        pr_number=pr.number,
+        bounty_eth=bounty_eth,
+        branch=solution.branch_name,
+    )
+    log.info("Issue #%d: PR opened at %s", issue.number, pr.url)
+
+
+def check_open_prs(gh: GithubClient, state: State) -> None:
+    """Poll submitted PRs and log when they are merged."""
+    for job in state.all_submitted():
+        if job.pr_number is None:
+            continue
+        try:
+            pr_info: PRInfo = gh.get_pr_info(job.repo, job.pr_number)
+        except Exception as exc:
+            log.warning("Could not fetch PR #%d in %s: %s", job.pr_number, job.repo, exc)
+            continue
+
+        if pr_info.merged:
+            log.info(
+                "PR #%d in %s MERGED — expected payment: %.4f ETH",
+                job.pr_number,
+                job.repo,
+                job.bounty_eth or 0,
+            )
+            state.mark_merged(job.issue_url)
+        elif pr_info.state == "closed":
+            # Closed without merging — treat as failed.
+            log.info("PR #%d in %s closed without merge.", job.pr_number, job.repo)
+            state.mark_failed(job.issue_url, job.repo, job.issue_number)
+
+
+def scan_repos(
+    gh: GithubClient,
+    solver: IssueSolver,
+    state: State,
+    config: dict,
+) -> None:
+    """One full scan: check all target repos for solvable bounty issues."""
+    min_bounty = config["min_bounty_eth"]
+
+    for repo_name in config["target_repos"]:
+        log.info("Scanning %s ...", repo_name)
+        try:
+            issues = gh.get_open_issues(repo_name)
+        except Exception as exc:
+            log.error("Could not fetch issues from %s: %s", repo_name, exc)
+            continue
+
+        for issue in issues:
+            if state.is_known(issue.url):
+                continue
+
+            bounty_eth = extract_from_issue(issue.body, issue.comment_bodies)
+            if bounty_eth is None or bounty_eth < min_bounty:
+                continue
+
+            process_issue(issue, bounty_eth, gh, solver, state, config)
+
+    check_open_prs(gh, state)
+
+    summary = state.summary()
+    log.info("State: %s", summary)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    # Print identity banner.
+    identity = load_public_identity()
+    if not verify_identity(identity):
+        log.error("Identity signature invalid — run register.py --verify")
+        sys.exit(1)
+
+    log.info(
+        "Agent: %s  |  %s  |  track: %s",
+        identity["name"],
+        identity["address"],
+        identity["track"],
+    )
+
+    cfg = _config()
+    gh = GithubClient(cfg["github_token"], cfg["github_username"])
+    solver = IssueSolver(cfg["anthropic_key"], gh)
+    state = State()
+
+    log.info(
+        "Watching repos: %s  |  poll every %ds  |  min bounty: %.4f ETH",
+        ", ".join(cfg["target_repos"]),
+        cfg["poll_interval"],
+        cfg["min_bounty_eth"],
+    )
+
+    # Run one immediate scan, then loop on the poll interval.
+    while True:
+        try:
+            scan_repos(gh, solver, state, cfg)
+        except KeyboardInterrupt:
+            log.info("Interrupted — shutting down.")
+            break
+        except Exception as exc:
+            log.error("Unhandled error in scan loop: %s", exc, exc_info=True)
+
+        log.info("Sleeping %ds until next scan ...", cfg["poll_interval"])
+        time.sleep(cfg["poll_interval"])
+
+
+if __name__ == "__main__":
+    main()
