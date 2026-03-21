@@ -33,6 +33,7 @@ from implementer import ImplementationResult, SeniorEngineer
 from planner import IssuePlanner
 from solver import IssueSolver, FileChange, Solution
 from state import State
+from test_writer import TestEngineer, TestWriterResult, find_test_paths
 
 load_dotenv()
 
@@ -101,6 +102,7 @@ def process_issue(
     evaluator: BountyEvaluator,
     planner: IssuePlanner,
     engineer: SeniorEngineer,
+    test_engineer: TestEngineer,
     solver: IssueSolver,
     state: State,
 ) -> None:
@@ -207,6 +209,29 @@ def process_issue(
         len(solution.changes),
     )
 
+    # Step 5 — Test: write tests that reproduce the issue and validate the fix.
+    test_paths = find_test_paths(file_tree)
+    existing_tests = gh.read_files(issue.repo_full_name, test_paths) if test_paths else {}
+    updated_files_map = {c.path: c.content for c in solution.changes if c.action != "delete"}
+    test_result: TestWriterResult = test_engineer.write_tests(
+        summary=issue.body,
+        updated_files=updated_files_map,
+        test_files=existing_tests,
+    )
+    if test_result.succeeded:
+        log.info(
+            "Issue #%d: test engineer wrote %d test file(s).",
+            issue.number,
+            len(test_result.test_files),
+        )
+        for tf in test_result.test_files:
+            # Determine action: modify if the file already exists in the solution
+            # or the repo, create otherwise.
+            action = "modify" if tf.file_path in updated_files_map or tf.file_path in existing_tests else "create"
+            solution.changes.append(FileChange(path=tf.file_path, content=tf.content, action=action))
+    else:
+        log.info("Issue #%d: test engineer produced no tests.", issue.number)
+
     # Fork + push + open PR.
     try:
         fork_name = gh.ensure_fork(issue.repo_full_name)
@@ -267,11 +292,12 @@ def scan_repos(
     evaluator: BountyEvaluator,
     planner: IssuePlanner,
     engineer: SeniorEngineer,
+    test_engineer: TestEngineer,
     solver: IssueSolver,
     state: State,
     config: dict,
 ) -> None:
-    """One full scan: evaluate, plan, implement, and solve bounty issues."""
+    """One full scan: evaluate, plan, implement, test, and solve bounty issues."""
     min_bounty = config["min_bounty_eth"]
 
     for repo_name in config["target_repos"]:
@@ -290,7 +316,7 @@ def scan_repos(
             if bounty_eth is None or bounty_eth < min_bounty:
                 continue
 
-            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, solver, state)
+            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, solver, state)
 
     check_open_prs(gh, state)
     log.info("State: %s", state.summary())
@@ -319,6 +345,7 @@ def main() -> None:
     evaluator = BountyEvaluator(cfg["anthropic_key"])
     planner = IssuePlanner(cfg["anthropic_key"])
     engineer = SeniorEngineer(cfg["anthropic_key"])
+    test_engineer = TestEngineer(cfg["anthropic_key"])
     solver = IssueSolver(cfg["anthropic_key"], gh)
     state = State()
 
@@ -331,7 +358,7 @@ def main() -> None:
 
     while True:
         try:
-            scan_repos(gh, evaluator, planner, engineer, solver, state, cfg)
+            scan_repos(gh, evaluator, planner, engineer, test_engineer, solver, state, cfg)
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down.")
             break
