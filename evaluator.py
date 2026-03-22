@@ -209,9 +209,24 @@ def _parse_result(data: dict) -> EvaluationResult:
             )
         )
 
+        llm_should_attempt = bool(data.get("should_attempt", False))
+        reason = str(data.get("reason", ""))
+
+        # Hard constraints — override LLM verdict if any threshold is violated.
+        should_attempt = llm_should_attempt
+        if success_prob <= 0.8:
+            should_attempt = False
+            reason = f"success_probability {success_prob:.2f} ≤ 0.8"
+        elif expected_value <= 0:
+            should_attempt = False
+            reason = f"expected_value {expected_value:.4f} ETH is not positive"
+        elif estimated_hours >= 3:
+            should_attempt = False
+            reason = f"estimated_hours {estimated_hours:.1f} ≥ 3"
+
         return EvaluationResult(
-            should_attempt=bool(data.get("should_attempt", False)),
-            reason=str(data.get("reason", "")),
+            should_attempt=should_attempt,
+            reason=reason,
             issue_type=issue_type,
             estimated_hours=estimated_hours,
             success_probability=success_prob,
