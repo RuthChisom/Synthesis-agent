@@ -260,55 +260,67 @@ def process_issue(
             "; ".join(review.issues),
         )
 
-    if not review.approve:
+    # Step 7 — Fix loop: up to MAX_FIX_CYCLES rounds of FIX → REVIEW.
+    MAX_FIX_CYCLES = 3
+    fix_cycle = 0
+    while not review.approve and fix_cycle < MAX_FIX_CYCLES:
+        fix_cycle += 1
         log.info(
-            "Issue #%d: review REJECTED (priority=%s) — attempting self-fix.",
+            "Issue #%d: review REJECTED (priority=%s, cycle %d/%d) — attempting self-fix.",
             issue.number,
             review.fix_priority,
+            fix_cycle,
+            MAX_FIX_CYCLES,
         )
 
-        # Step 7 — Fix: repair all reviewer issues, then re-review once.
         fix_result: FixerResult = fixer.fix(
             updated_files=all_files_map,
             issues=review.issues,
         )
 
-        if fix_result.succeeded:
-            # Apply fixed files back into solution.changes.
-            for change in solution.changes:
-                if change.path in fix_result.updated_files:
-                    change.content = fix_result.updated_files[change.path]
-            # Add any new files the fixer introduced.
-            existing_paths = {c.path for c in solution.changes}
-            for path, content in fix_result.updated_files.items():
-                if path not in existing_paths:
-                    solution.changes.append(FileChange(path=path, content=content, action="modify"))
+        if not fix_result.succeeded:
+            log.info("Issue #%d: fixer produced no output — abandoning fix loop.", issue.number)
+            break
 
-            # Rebuild the file maps for re-review.
-            all_files_map = {c.path: c.content for c in solution.changes if c.action != "delete"}
-            test_files_map = {
-                c.path: c.content
-                for c in solution.changes
-                if c.action != "delete" and find_test_paths(c.path)
-            }
+        # Apply fixed files back into solution.changes.
+        for change in solution.changes:
+            if change.path in fix_result.updated_files:
+                change.content = fix_result.updated_files[change.path]
+        # Add any new files the fixer introduced.
+        existing_paths = {c.path for c in solution.changes}
+        for path, content in fix_result.updated_files.items():
+            if path not in existing_paths:
+                solution.changes.append(FileChange(path=path, content=content, action="modify"))
 
-            log.info("Issue #%d: re-reviewing after fix (%d file(s) updated).", issue.number, len(fix_result.updated_files))
-            review = reviewer.review(
-                issue_summary=issue.body,
-                updated_files=all_files_map,
-                test_files=test_files_map,
+        # Rebuild file maps for re-review.
+        all_files_map = {c.path: c.content for c in solution.changes if c.action != "delete"}
+        test_files_map = {
+            c.path: c.content
+            for c in solution.changes
+            if c.action != "delete" and find_test_paths(c.path)
+        }
+
+        log.info(
+            "Issue #%d: re-reviewing after fix cycle %d/%d (%d file(s) updated).",
+            issue.number,
+            fix_cycle,
+            MAX_FIX_CYCLES,
+            len(fix_result.updated_files),
+        )
+        review = reviewer.review(
+            issue_summary=issue.body,
+            updated_files=all_files_map,
+            test_files=test_files_map,
+        )
+        if review.issues:
+            log.info(
+                "Issue #%d re-review issues [%s]: %s",
+                issue.number,
+                review.fix_priority,
+                "; ".join(review.issues),
             )
-            if review.issues:
-                log.info(
-                    "Issue #%d re-review issues [%s]: %s",
-                    issue.number,
-                    review.fix_priority,
-                    "; ".join(review.issues),
-                )
-        else:
-            log.info("Issue #%d: fixer produced no output — abandoning.", issue.number)
 
-        if not review.approve:
+    if not review.approve:
             log.info(
                 "Issue #%d: review REJECTED after fix attempt — skipping PR submission.",
                 issue.number,
