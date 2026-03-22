@@ -39,6 +39,10 @@ from fixer import ReviewFixer, FixerResult
 from pr_writer import PRWriter, PRDraft
 from pr_monitor import PRStatusEvaluator, MonitorResult
 from auditor import SystemAuditor, AuditResult
+from validation import validate_discovery, validate_plan, validate_build, validate_review, ValidationError
+from pipeline_state import PipelineState, PipelineIncompleteError, FinalResult
+from log_utils import log_discovery, log_plan, log_build, log_test, log_review, log_fix_loop, log_pr, log_audit, log_outcome, log_final
+from outcome_validator import run_tests_if_possible
 
 load_dotenv()
 
@@ -114,8 +118,11 @@ def process_issue(
     solver: IssueSolver,
     state: State,
     auditor: SystemAuditor,
-) -> None:
+) -> FinalResult:
     """Evaluate, plan, solve, and submit a PR for one bounty issue."""
+    ps = PipelineState()
+    errors: list[str] = []
+
     log.info(
         "Evaluating issue #%d in %s  [bounty: %.4f ETH]",
         issue.number,
@@ -140,22 +147,27 @@ def process_issue(
         recent_commits=recent_commits,
     )
 
-    log.info(
-        "Issue #%d evaluation: should_attempt=%s  type=%s  "
-        "hours=%.1f  p(success)=%.2f  ev=%.4f ETH  reason=%s",
-        issue.number,
-        evaluation.should_attempt,
-        evaluation.issue_type,
-        evaluation.estimated_hours,
-        evaluation.success_probability,
-        evaluation.expected_value,
-        evaluation.reason,
-    )
+    try:
+        validate_discovery(evaluation)
+    except ValidationError as exc:
+        errors.append(f"Discovery validation: {exc}")
+        log_discovery(issue.number, False, str(exc), 0.0, 0.0)
+        result = FinalResult(issue=issue.title, status="FAILED", pr_url=None,
+                             confidence=0.0, errors=errors, pipeline=ps.to_dict())
+        log_final(issue.number, result)
+        return result
+
+    log_discovery(issue.number, evaluation.should_attempt, evaluation.reason,
+                  evaluation.success_probability, evaluation.expected_value)
+    ps.discovered = True
 
     if not evaluation.should_attempt:
-        log.info("Issue #%d skipped: %s", issue.number, evaluation.reason)
         state.mark_skipped(issue.url, issue.repo_full_name, issue.number)
-        return
+        result = FinalResult(issue=issue.title, status="FAILED", pr_url=None,
+                             confidence=evaluation.success_probability,
+                             errors=[evaluation.reason], pipeline=ps.to_dict())
+        log_final(issue.number, result)
+        return result
 
     # Step 2 — Plan: architect-level breakdown of exact changes needed.
     file_tree = gh.get_file_tree(issue.repo_full_name)
@@ -167,16 +179,20 @@ def process_issue(
     )
 
     if plan.steps:
+        try:
+            validate_plan(plan)
+        except ValidationError as exc:
+            errors.append(f"Plan validation: {exc}")
+            log.warning("Issue #%d: plan validation warning: %s", issue.number, exc)
+        log_plan(issue.number, len(plan.steps), len(plan.all_files))
         log.info(
             "Issue #%d plan: %d steps, %d files, %d edge cases, %d tests",
-            issue.number,
-            len(plan.steps),
-            len(plan.all_files),
-            len(plan.edge_cases),
-            len(plan.tests_needed),
+            issue.number, len(plan.steps), len(plan.all_files),
+            len(plan.edge_cases), len(plan.tests_needed),
         )
     else:
         log.info("Issue #%d: planner returned empty plan — proceeding without it.", issue.number)
+    ps.planned = True
 
     # Step 3 — Implement: read the exact files the plan named, then write the fix.
     solution: Solution | None = None
@@ -184,18 +200,16 @@ def process_issue(
         files_content = gh.read_files(issue.repo_full_name, plan.all_files)
         log.info(
             "Issue #%d: read %d/%d planned files for implementer.",
-            issue.number,
-            len(files_content),
-            len(plan.all_files),
+            issue.number, len(files_content), len(plan.all_files),
         )
         impl: ImplementationResult = engineer.implement(plan, files_content)
         if impl.succeeded:
-            log.info(
-                "Issue #%d: implementer produced %d file(s) — %s",
-                issue.number,
-                len(impl.updated_files),
-                impl.summary_of_changes,
-            )
+            try:
+                validate_build(impl)
+            except ValidationError as exc:
+                errors.append(f"Build validation: {exc}")
+                log.warning("Issue #%d: build validation warning: %s", issue.number, exc)
+            log_build(issue.number, len(impl.updated_files), impl.summary_of_changes)
             solution = _solution_from_implementation(impl, issue)
 
     # Step 4 — Fallback: if implementer produced nothing, use the multi-turn solver.
@@ -209,13 +223,17 @@ def process_issue(
     if solution is None:
         log.info("Issue #%d: no solution generated.", issue.number)
         state.mark_failed(issue.url, issue.repo_full_name, issue.number)
-        return
+        result = FinalResult(issue=issue.title, status="FAILED", pr_url=None,
+                             confidence=evaluation.success_probability,
+                             errors=errors + ["No solution generated"],
+                             pipeline=ps.to_dict())
+        log_final(issue.number, result)
+        return result
 
+    ps.built = True
     log.info(
         "Issue #%d: solution ready  confidence=%s  files=%d",
-        issue.number,
-        solution.confidence,
-        len(solution.changes),
+        issue.number, solution.confidence, len(solution.changes),
     )
 
     # Step 5 — Test: write tests that reproduce the issue and validate the fix.
@@ -228,52 +246,56 @@ def process_issue(
         test_files=existing_tests,
     )
     if test_result.succeeded:
-        log.info(
-            "Issue #%d: test engineer wrote %d test file(s).",
-            issue.number,
-            len(test_result.test_files),
-        )
+        log_test(issue.number, len(test_result.test_files))
         for tf in test_result.test_files:
-            # Determine action: modify if the file already exists in the solution
-            # or the repo, create otherwise.
+            # Determine action: modify if file already exists in solution or repo.
             action = "modify" if tf.file_path in updated_files_map or tf.file_path in existing_tests else "create"
             solution.changes.append(FileChange(path=tf.file_path, content=tf.content, action=action))
+        ps.tested = True
     else:
         log.info("Issue #%d: test engineer produced no tests.", issue.number)
 
-    # Step 6 — Review: strict pre-submission gate to prevent bad PRs.
+    # Rebuild maps after tests are merged in.
     all_files_map = {c.path: c.content for c in solution.changes if c.action != "delete"}
     test_files_map = {
         c.path: c.content
         for c in solution.changes
         if c.action != "delete" and find_test_paths(c.path)
     }
+    impl_files_map = {p: v for p, v in all_files_map.items() if p not in test_files_map}
+
+    # Outcome validation — static analysis / pytest run before review.
+    outcome = run_tests_if_possible(impl_files_map, test_files_map)
+    log_outcome(issue.number, outcome.passed, outcome.stderr[:120] if not outcome.passed else "")
+    if not outcome.passed:
+        log.warning("Issue #%d: outcome validation failed — %s", issue.number, outcome.stderr)
+        errors.append(f"Outcome validation: {outcome.stderr}")
+        state.mark_failed(issue.url, issue.repo_full_name, issue.number)
+        result = FinalResult(issue=issue.title, status="FAILED", pr_url=None,
+                             confidence=evaluation.success_probability,
+                             errors=errors, pipeline=ps.to_dict())
+        log_final(issue.number, result)
+        return result
+
+    # Step 6 — Review: strict pre-submission gate to prevent bad PRs.
     review: ReviewResult = reviewer.review(
         issue_summary=issue.body,
         updated_files=all_files_map,
         test_files=test_files_map,
     )
-
-    if review.issues:
-        log.info(
-            "Issue #%d review issues [%s]: %s",
-            issue.number,
-            review.fix_priority,
-            "; ".join(review.issues),
-        )
+    try:
+        validate_review(review)
+    except ValidationError as exc:
+        errors.append(f"Review validation: {exc}")
+        log.warning("Issue #%d: review validation warning: %s", issue.number, exc)
+    log_review(issue.number, review.approve, review.fix_priority, review.issues)
 
     # Step 7 — Fix loop: up to MAX_FIX_CYCLES rounds of FIX → REVIEW.
     MAX_FIX_CYCLES = 3
     fix_cycle = 0
     while not review.approve and fix_cycle < MAX_FIX_CYCLES:
         fix_cycle += 1
-        log.info(
-            "Issue #%d: review REJECTED (priority=%s, cycle %d/%d) — attempting self-fix.",
-            issue.number,
-            review.fix_priority,
-            fix_cycle,
-            MAX_FIX_CYCLES,
-        )
+        log_fix_loop(issue.number, fix_cycle, MAX_FIX_CYCLES)
 
         fix_result: FixerResult = fixer.fix(
             updated_files=all_files_map,
@@ -304,33 +326,37 @@ def process_issue(
 
         log.info(
             "Issue #%d: re-reviewing after fix cycle %d/%d (%d file(s) updated).",
-            issue.number,
-            fix_cycle,
-            MAX_FIX_CYCLES,
-            len(fix_result.updated_files),
+            issue.number, fix_cycle, MAX_FIX_CYCLES, len(fix_result.updated_files),
         )
         review = reviewer.review(
             issue_summary=issue.body,
             updated_files=all_files_map,
             test_files=test_files_map,
         )
-        if review.issues:
-            log.info(
-                "Issue #%d re-review issues [%s]: %s",
-                issue.number,
-                review.fix_priority,
-                "; ".join(review.issues),
-            )
+        try:
+            validate_review(review)
+        except ValidationError as exc:
+            errors.append(f"Re-review validation: {exc}")
+            log.warning("Issue #%d: re-review validation warning: %s", issue.number, exc)
+        log_review(issue.number, review.approve, review.fix_priority, review.issues)
+
+    ps.reviewed = True
 
     if not review.approve:
-            log.info(
-                "Issue #%d: review REJECTED after fix attempt — skipping PR submission.",
-                issue.number,
-            )
-            state.mark_failed(issue.url, issue.repo_full_name, issue.number)
-            return
+        log.info(
+            "Issue #%d: review REJECTED after %d fix attempt(s) — skipping PR.",
+            issue.number, fix_cycle,
+        )
+        state.mark_failed(issue.url, issue.repo_full_name, issue.number)
+        result = FinalResult(issue=issue.title, status="FAILED", pr_url=None,
+                             confidence=evaluation.success_probability,
+                             errors=errors + [f"Review rejected: {'; '.join(review.issues)}"],
+                             pipeline=ps.to_dict())
+        log_final(issue.number, result)
+        return result
 
     log.info("Issue #%d: review APPROVED.", issue.number)
+    ps.approved = True
 
     # Step 8 — PR: write a professional, trust-building pull request description.
     draft: PRDraft = pr_writer.write(
@@ -358,7 +384,15 @@ def process_issue(
     except Exception as exc:
         log.error("Issue #%d: failed to submit PR: %s", issue.number, exc)
         state.mark_failed(issue.url, issue.repo_full_name, issue.number)
-        return
+        result = FinalResult(issue=issue.title, status="FAILED", pr_url=None,
+                             confidence=evaluation.success_probability,
+                             errors=errors + [f"PR submission failed: {exc}"],
+                             pipeline=ps.to_dict())
+        log_final(issue.number, result)
+        return result
+
+    ps.pr_created = True
+    log_pr(issue.number, pr.url)
 
     state.mark_submitted(
         issue_url=issue.url,
@@ -369,13 +403,18 @@ def process_issue(
         bounty_eth=bounty_eth,
         branch=solution.branch_name,
     )
-    log.info("Issue #%d: PR opened at %s", issue.number, pr.url)
+
+    # Verify all required stages completed.
+    try:
+        ps.verify_complete()
+    except PipelineIncompleteError as exc:
+        log.warning("Issue #%d: %s", issue.number, exc)
+        errors.append(str(exc))
 
     # Step 9 — Audit: independent post-submission evaluation of the full pipeline.
     audit: AuditResult = auditor.audit(
         issue=f"{issue.title}\n\n{issue.body}",
-        plan=str({"steps": [s for s in (plan.steps if plan.steps else [])],
-                  "edge_cases": plan.edge_cases,
+        plan=str({"steps": plan.steps, "edge_cases": plan.edge_cases,
                   "tests_needed": plan.tests_needed}),
         updated_files={c.path: c.content for c in solution.changes if c.action != "delete"},
         test_files=test_files_map,
@@ -383,18 +422,23 @@ def process_issue(
                     "fix_priority": review.fix_priority}),
         pr_status="submitted",
     )
-    log.info(
-        "Issue #%d audit: success=%s  confidence=%.2f  problems=%d  improvements=%d",
-        issue.number,
-        audit.success,
-        audit.confidence,
-        len(audit.problems),
-        len(audit.improvements),
-    )
+    log_audit(issue.number, audit.success, audit.confidence,
+              len(audit.problems), len(audit.improvements))
     if audit.problems:
         log.info("Issue #%d audit problems: %s", issue.number, "; ".join(audit.problems))
     if audit.improvements:
         log.info("Issue #%d audit improvements: %s", issue.number, "; ".join(audit.improvements))
+
+    result = FinalResult(
+        issue=issue.title,
+        status="SUCCESS" if audit.success else "FAILED",
+        pr_url=pr.url,
+        confidence=audit.confidence,
+        errors=errors + audit.problems,
+        pipeline=ps.to_dict(),
+    )
+    log_final(issue.number, result)
+    return result
 
 
 def check_open_prs(
@@ -509,7 +553,10 @@ def scan_repos(
             if bounty_eth is None or bounty_eth < min_bounty:
                 continue
 
-            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, solver, state, auditor)
+            process_issue(
+                issue, bounty_eth, gh, evaluator, planner, engineer,
+                test_engineer, reviewer, fixer, pr_writer, solver, state, auditor,
+            )
 
     check_open_prs(gh, monitor, state)
     log.info("State: %s", state.summary())
