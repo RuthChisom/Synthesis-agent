@@ -38,6 +38,7 @@ from reviewer import PRReviewer, ReviewResult
 from fixer import ReviewFixer, FixerResult
 from pr_writer import PRWriter, PRDraft
 from pr_monitor import PRStatusEvaluator, MonitorResult
+from auditor import SystemAuditor, AuditResult
 
 load_dotenv()
 
@@ -112,6 +113,7 @@ def process_issue(
     pr_writer: PRWriter,
     solver: IssueSolver,
     state: State,
+    auditor: SystemAuditor,
 ) -> None:
     """Evaluate, plan, solve, and submit a PR for one bounty issue."""
     log.info(
@@ -369,6 +371,31 @@ def process_issue(
     )
     log.info("Issue #%d: PR opened at %s", issue.number, pr.url)
 
+    # Step 9 — Audit: independent post-submission evaluation of the full pipeline.
+    audit: AuditResult = auditor.audit(
+        issue=f"{issue.title}\n\n{issue.body}",
+        plan=str({"steps": [s for s in (plan.steps if plan.steps else [])],
+                  "edge_cases": plan.edge_cases,
+                  "tests_needed": plan.tests_needed}),
+        updated_files={c.path: c.content for c in solution.changes if c.action != "delete"},
+        test_files=test_files_map,
+        review=str({"approve": review.approve, "issues": review.issues,
+                    "fix_priority": review.fix_priority}),
+        pr_status="submitted",
+    )
+    log.info(
+        "Issue #%d audit: success=%s  confidence=%.2f  problems=%d  improvements=%d",
+        issue.number,
+        audit.success,
+        audit.confidence,
+        len(audit.problems),
+        len(audit.improvements),
+    )
+    if audit.problems:
+        log.info("Issue #%d audit problems: %s", issue.number, "; ".join(audit.problems))
+    if audit.improvements:
+        log.info("Issue #%d audit improvements: %s", issue.number, "; ".join(audit.improvements))
+
 
 def check_open_prs(
     gh: GithubClient,
@@ -461,6 +488,7 @@ def scan_repos(
     solver: IssueSolver,
     state: State,
     config: dict,
+    auditor: SystemAuditor,
 ) -> None:
     """One full scan: evaluate, plan, implement, test, review, fix, write PR, submit, and monitor."""
     min_bounty = config["min_bounty_eth"]
@@ -481,7 +509,7 @@ def scan_repos(
             if bounty_eth is None or bounty_eth < min_bounty:
                 continue
 
-            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, solver, state)
+            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, solver, state, auditor)
 
     check_open_prs(gh, monitor, state)
     log.info("State: %s", state.summary())
@@ -516,6 +544,7 @@ def main() -> None:
     pr_writer = PRWriter(cfg["anthropic_key"])
     monitor = PRStatusEvaluator(cfg["anthropic_key"])
     solver = IssueSolver(cfg["anthropic_key"], gh)
+    auditor = SystemAuditor(cfg["anthropic_key"])
     state = State()
 
     log.info(
@@ -527,7 +556,7 @@ def main() -> None:
 
     while True:
         try:
-            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, monitor, solver, state, cfg)
+            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, monitor, solver, state, cfg, auditor)
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down.")
             break
