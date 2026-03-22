@@ -187,6 +187,11 @@ def find_test_paths(file_tree: str) -> list[str]:
     return [p for p in paths if _TEST_PATH_RE.search(p)][:20]
 
 
+def is_test_file(path: str) -> bool:
+    """Return True if the given file path looks like a test file."""
+    return bool(_TEST_PATH_RE.search(path))
+
+
 def _truncate(text: str, max_chars: int) -> str:
     text = (text or "").strip()
     if len(text) <= max_chars:

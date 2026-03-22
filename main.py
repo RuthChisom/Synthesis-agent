@@ -33,7 +33,7 @@ from implementer import ImplementationResult, SeniorEngineer
 from planner import IssuePlanner
 from solver import IssueSolver, FileChange, Solution
 from state import State
-from test_writer import TestEngineer, TestWriterResult, find_test_paths
+from test_writer import TestEngineer, TestWriterResult, find_test_paths, is_test_file
 from reviewer import PRReviewer, ReviewResult
 from fixer import ReviewFixer, FixerResult
 from pr_writer import PRWriter, PRDraft
@@ -260,7 +260,7 @@ def process_issue(
     test_files_map = {
         c.path: c.content
         for c in solution.changes
-        if c.action != "delete" and find_test_paths(c.path)
+        if c.action != "delete" and is_test_file(c.path)
     }
     impl_files_map = {p: v for p, v in all_files_map.items() if p not in test_files_map}
 
@@ -321,7 +321,7 @@ def process_issue(
         test_files_map = {
             c.path: c.content
             for c in solution.changes
-            if c.action != "delete" and find_test_paths(c.path)
+            if c.action != "delete" and is_test_file(c.path)
         }
 
         log.info(
