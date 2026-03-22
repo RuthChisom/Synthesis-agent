@@ -36,6 +36,7 @@ from state import State
 from test_writer import TestEngineer, TestWriterResult, find_test_paths
 from reviewer import PRReviewer, ReviewResult
 from fixer import ReviewFixer, FixerResult
+from pr_writer import PRWriter, PRDraft
 
 load_dotenv()
 
@@ -107,6 +108,7 @@ def process_issue(
     test_engineer: TestEngineer,
     reviewer: PRReviewer,
     fixer: ReviewFixer,
+    pr_writer: PRWriter,
     solver: IssueSolver,
     state: State,
 ) -> None:
@@ -315,6 +317,17 @@ def process_issue(
 
     log.info("Issue #%d: review APPROVED.", issue.number)
 
+    # Step 8 — PR: write a professional, trust-building pull request description.
+    draft: PRDraft = pr_writer.write(
+        issue_title=issue.title,
+        issue_body=issue.body,
+        changes_summary=solution.pr_body,
+        issue_number=issue.number,
+    )
+    solution.pr_title = draft.title
+    solution.pr_body = draft.body
+    log.info("Issue #%d: PR title — %s", issue.number, draft.title)
+
     # Fork + push + open PR.
     try:
         fork_name = gh.ensure_fork(issue.repo_full_name)
@@ -378,11 +391,12 @@ def scan_repos(
     test_engineer: TestEngineer,
     reviewer: PRReviewer,
     fixer: ReviewFixer,
+    pr_writer: PRWriter,
     solver: IssueSolver,
     state: State,
     config: dict,
 ) -> None:
-    """One full scan: evaluate, plan, implement, test, review, fix, and submit bounty PRs."""
+    """One full scan: evaluate, plan, implement, test, review, fix, write PR, and submit."""
     min_bounty = config["min_bounty_eth"]
 
     for repo_name in config["target_repos"]:
@@ -401,7 +415,7 @@ def scan_repos(
             if bounty_eth is None or bounty_eth < min_bounty:
                 continue
 
-            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, solver, state)
+            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, solver, state)
 
     check_open_prs(gh, state)
     log.info("State: %s", state.summary())
@@ -433,6 +447,7 @@ def main() -> None:
     test_engineer = TestEngineer(cfg["anthropic_key"])
     reviewer = PRReviewer(cfg["anthropic_key"])
     fixer = ReviewFixer(cfg["anthropic_key"])
+    pr_writer = PRWriter(cfg["anthropic_key"])
     solver = IssueSolver(cfg["anthropic_key"], gh)
     state = State()
 
@@ -445,7 +460,7 @@ def main() -> None:
 
     while True:
         try:
-            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, solver, state, cfg)
+            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, solver, state, cfg)
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down.")
             break
