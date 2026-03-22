@@ -35,6 +35,7 @@ from solver import IssueSolver, FileChange, Solution
 from state import State
 from test_writer import TestEngineer, TestWriterResult, find_test_paths
 from reviewer import PRReviewer, ReviewResult
+from fixer import ReviewFixer, FixerResult
 
 load_dotenv()
 
@@ -105,6 +106,7 @@ def process_issue(
     engineer: SeniorEngineer,
     test_engineer: TestEngineer,
     reviewer: PRReviewer,
+    fixer: ReviewFixer,
     solver: IssueSolver,
     state: State,
 ) -> None:
@@ -257,12 +259,59 @@ def process_issue(
 
     if not review.approve:
         log.info(
-            "Issue #%d: review REJECTED (priority=%s) — skipping PR submission.",
+            "Issue #%d: review REJECTED (priority=%s) — attempting self-fix.",
             issue.number,
             review.fix_priority,
         )
-        state.mark_failed(issue.url, issue.repo_full_name, issue.number)
-        return
+
+        # Step 7 — Fix: repair all reviewer issues, then re-review once.
+        fix_result: FixerResult = fixer.fix(
+            updated_files=all_files_map,
+            issues=review.issues,
+        )
+
+        if fix_result.succeeded:
+            # Apply fixed files back into solution.changes.
+            for change in solution.changes:
+                if change.path in fix_result.updated_files:
+                    change.content = fix_result.updated_files[change.path]
+            # Add any new files the fixer introduced.
+            existing_paths = {c.path for c in solution.changes}
+            for path, content in fix_result.updated_files.items():
+                if path not in existing_paths:
+                    solution.changes.append(FileChange(path=path, content=content, action="modify"))
+
+            # Rebuild the file maps for re-review.
+            all_files_map = {c.path: c.content for c in solution.changes if c.action != "delete"}
+            test_files_map = {
+                c.path: c.content
+                for c in solution.changes
+                if c.action != "delete" and find_test_paths(c.path)
+            }
+
+            log.info("Issue #%d: re-reviewing after fix (%d file(s) updated).", issue.number, len(fix_result.updated_files))
+            review = reviewer.review(
+                issue_summary=issue.body,
+                updated_files=all_files_map,
+                test_files=test_files_map,
+            )
+            if review.issues:
+                log.info(
+                    "Issue #%d re-review issues [%s]: %s",
+                    issue.number,
+                    review.fix_priority,
+                    "; ".join(review.issues),
+                )
+        else:
+            log.info("Issue #%d: fixer produced no output — abandoning.", issue.number)
+
+        if not review.approve:
+            log.info(
+                "Issue #%d: review REJECTED after fix attempt — skipping PR submission.",
+                issue.number,
+            )
+            state.mark_failed(issue.url, issue.repo_full_name, issue.number)
+            return
 
     log.info("Issue #%d: review APPROVED.", issue.number)
 
@@ -328,11 +377,12 @@ def scan_repos(
     engineer: SeniorEngineer,
     test_engineer: TestEngineer,
     reviewer: PRReviewer,
+    fixer: ReviewFixer,
     solver: IssueSolver,
     state: State,
     config: dict,
 ) -> None:
-    """One full scan: evaluate, plan, implement, test, review, and submit bounty PRs."""
+    """One full scan: evaluate, plan, implement, test, review, fix, and submit bounty PRs."""
     min_bounty = config["min_bounty_eth"]
 
     for repo_name in config["target_repos"]:
@@ -351,7 +401,7 @@ def scan_repos(
             if bounty_eth is None or bounty_eth < min_bounty:
                 continue
 
-            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, solver, state)
+            process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, solver, state)
 
     check_open_prs(gh, state)
     log.info("State: %s", state.summary())
@@ -382,6 +432,7 @@ def main() -> None:
     engineer = SeniorEngineer(cfg["anthropic_key"])
     test_engineer = TestEngineer(cfg["anthropic_key"])
     reviewer = PRReviewer(cfg["anthropic_key"])
+    fixer = ReviewFixer(cfg["anthropic_key"])
     solver = IssueSolver(cfg["anthropic_key"], gh)
     state = State()
 
@@ -394,7 +445,7 @@ def main() -> None:
 
     while True:
         try:
-            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, solver, state, cfg)
+            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, solver, state, cfg)
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down.")
             break
