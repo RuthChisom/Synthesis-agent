@@ -37,6 +37,7 @@ from test_writer import TestEngineer, TestWriterResult, find_test_paths
 from reviewer import PRReviewer, ReviewResult
 from fixer import ReviewFixer, FixerResult
 from pr_writer import PRWriter, PRDraft
+from pr_monitor import PRStatusEvaluator, MonitorResult
 
 load_dotenv()
 
@@ -357,19 +358,29 @@ def process_issue(
     log.info("Issue #%d: PR opened at %s", issue.number, pr.url)
 
 
-def check_open_prs(gh: GithubClient, state: State) -> None:
-    """Poll submitted PRs and log when they are merged."""
+def check_open_prs(
+    gh: GithubClient,
+    monitor: PRStatusEvaluator,
+    state: State,
+) -> None:
+    """
+    Poll submitted PRs, evaluate payment likelihood, and route each job:
+      merged       → mark_merged  (payment confirmed)
+      closed       → mark_failed  (no payment)
+      open + wait  → do nothing   (still pending)
+      open + revise→ mark_needs_revision  (maintainer wants changes)
+      open + abandon→ mark_failed (stale / implicitly rejected)
+    """
     for job in state.all_submitted():
         if job.pr_number is None:
             continue
         try:
             pr_info: PRInfo = gh.get_pr_info(job.repo, job.pr_number)
         except Exception as exc:
-            log.warning(
-                "Could not fetch PR #%d in %s: %s", job.pr_number, job.repo, exc
-            )
+            log.warning("Could not fetch PR #%d in %s: %s", job.pr_number, job.repo, exc)
             continue
 
+        # Fast-path: GitHub-confirmed terminal states need no AI evaluation.
         if pr_info.merged:
             log.info(
                 "PR #%d in %s MERGED — expected payment: %.4f ETH",
@@ -378,9 +389,51 @@ def check_open_prs(gh: GithubClient, state: State) -> None:
                 job.bounty_eth or 0,
             )
             state.mark_merged(job.issue_url)
-        elif pr_info.state == "closed":
+            continue
+
+        if pr_info.state == "closed":
             log.info("PR #%d in %s closed without merge.", job.pr_number, job.repo)
             state.mark_failed(job.issue_url, job.repo, job.issue_number)
+            continue
+
+        # PR is still open — ask the evaluator to assess payment likelihood.
+        try:
+            comments = gh.get_pr_comments(job.repo, job.pr_number)
+            issue_status = gh.get_issue_status(job.repo, job.issue_number)
+        except Exception as exc:
+            log.warning("Could not fetch context for PR #%d: %s", job.pr_number, exc)
+            continue
+
+        result: MonitorResult = monitor.evaluate(
+            pr_status=pr_info.state,
+            comments=comments,
+            issue_status=issue_status,
+        )
+
+        log.info(
+            "PR #%d in %s — accepted=%s  payment_expected=%s  next_action=%s",
+            job.pr_number,
+            job.repo,
+            result.pr_accepted,
+            result.payment_expected,
+            result.next_action,
+        )
+
+        if result.next_action == "revise":
+            log.info(
+                "PR #%d in %s flagged for revision — maintainer requested changes.",
+                job.pr_number,
+                job.repo,
+            )
+            state.mark_needs_revision(job.issue_url)
+        elif result.next_action == "abandon":
+            log.info(
+                "PR #%d in %s marked for abandonment — no payment expected.",
+                job.pr_number,
+                job.repo,
+            )
+            state.mark_failed(job.issue_url, job.repo, job.issue_number)
+        # next_action == "wait": no state change, re-evaluated next cycle.
 
 
 def scan_repos(
@@ -392,11 +445,12 @@ def scan_repos(
     reviewer: PRReviewer,
     fixer: ReviewFixer,
     pr_writer: PRWriter,
+    monitor: PRStatusEvaluator,
     solver: IssueSolver,
     state: State,
     config: dict,
 ) -> None:
-    """One full scan: evaluate, plan, implement, test, review, fix, write PR, and submit."""
+    """One full scan: evaluate, plan, implement, test, review, fix, write PR, submit, and monitor."""
     min_bounty = config["min_bounty_eth"]
 
     for repo_name in config["target_repos"]:
@@ -417,7 +471,7 @@ def scan_repos(
 
             process_issue(issue, bounty_eth, gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, solver, state)
 
-    check_open_prs(gh, state)
+    check_open_prs(gh, monitor, state)
     log.info("State: %s", state.summary())
 
 
@@ -448,6 +502,7 @@ def main() -> None:
     reviewer = PRReviewer(cfg["anthropic_key"])
     fixer = ReviewFixer(cfg["anthropic_key"])
     pr_writer = PRWriter(cfg["anthropic_key"])
+    monitor = PRStatusEvaluator(cfg["anthropic_key"])
     solver = IssueSolver(cfg["anthropic_key"], gh)
     state = State()
 
@@ -460,7 +515,7 @@ def main() -> None:
 
     while True:
         try:
-            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, solver, state, cfg)
+            scan_repos(gh, evaluator, planner, engineer, test_engineer, reviewer, fixer, pr_writer, monitor, solver, state, cfg)
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down.")
             break

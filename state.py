@@ -37,7 +37,7 @@ STATE_FILE = Path(__file__).parent / "state.json"
 @dataclass
 class Job:
     issue_url: str
-    status: str          # submitted | merged | skipped | failed
+    status: str          # submitted | merged | skipped | failed | needs_revision
     repo: str
     issue_number: int
     pr_url: Optional[str] = None
@@ -77,8 +77,9 @@ class State:
         return self._jobs.get(issue_url)
 
     def all_submitted(self) -> Iterator[Job]:
+        """Yield jobs that have an open PR still awaiting a merge decision."""
         for job in self._jobs.values():
-            if job.status == "submitted":
+            if job.status in ("submitted", "needs_revision"):
                 yield job
 
     def summary(self) -> dict[str, int]:
@@ -131,6 +132,12 @@ class State:
             submitted_at=_now(),
         )
         self._save()
+
+    def mark_needs_revision(self, issue_url: str) -> None:
+        job = self._jobs.get(issue_url)
+        if job:
+            job.status = "needs_revision"
+            self._save()
 
     def mark_merged(self, issue_url: str) -> None:
         job = self._jobs.get(issue_url)

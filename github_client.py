@@ -278,3 +278,31 @@ class GithubClient:
             state=pr.state,
             merged=pr.merged,
         )
+
+    def get_pr_comments(self, repo_full_name: str, pr_number: int) -> list[str]:
+        """
+        Return all issue-level comment bodies on a PR (maintainer feedback).
+        Excludes bot comments (bodies starting with '<!--').
+        """
+        repo = self._gh.get_repo(repo_full_name)
+        pr = repo.get_pull(pr_number)
+        try:
+            comments = [
+                c.body
+                for c in pr.get_issue_comments()
+                if c.body and not c.body.strip().startswith("<!--")
+            ]
+            return comments
+        except GithubException as exc:
+            log.warning("get_pr_comments %s#%d: %s", repo_full_name, pr_number, exc)
+            return []
+
+    def get_issue_status(self, repo_full_name: str, issue_number: int) -> str:
+        """Return 'open' or 'closed' for the given issue number."""
+        repo = self._gh.get_repo(repo_full_name)
+        try:
+            issue = repo.get_issue(issue_number)
+            return issue.state  # "open" or "closed"
+        except GithubException as exc:
+            log.warning("get_issue_status %s#%d: %s", repo_full_name, issue_number, exc)
+            return "open"  # assume open on error
